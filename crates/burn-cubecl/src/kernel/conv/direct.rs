@@ -29,6 +29,10 @@ struct Conv2dArgs {
     channels_per_group: u32,
 }
 
+// Bound one launch worth of work for the direct kernel. Very large monolithic launches can
+// trigger watchdog device-loss on desktop Vulkan drivers.
+const DIRECT_MAX_WORKING_UNITS_PER_DISPATCH: usize = 16_384;
+
 #[cube(launch_unchecked, address_type = "dynamic")]
 #[allow(clippy::redundant_closure)]
 fn direct_conv2d_kernel<E: Numeric, NIn: Size, NOut: Size>(
@@ -39,17 +43,25 @@ fn direct_conv2d_kernel<E: Numeric, NIn: Size, NOut: Size>(
     args: Conv2dArgs,
     shape_out: Sequence<FastDivmod<u32>>,
     shape_out_c: FastDivmod<u32>,
+    start_unit: usize,
+    chunk_units: usize,
     #[comptime] has_padding: bool,
     #[define(E)] _dtype: StorageType,
 ) {
-    if !output.is_in_bounds(ABSOLUTE_POS) {
+    if ABSOLUTE_POS >= chunk_units {
+        terminate!();
+    }
+
+    let absolute_unit = ABSOLUTE_POS + start_unit;
+
+    if !output.is_in_bounds(absolute_unit) {
         terminate!();
     }
 
     let n_spatial = comptime![shape_out.len()];
 
     let vector_size_out = output.vector_size();
-    let pos = ABSOLUTE_POS * vector_size_out;
+    let pos = absolute_unit * vector_size_out;
 
     let in_c_per_group = weight.shape(weight.rank() - 1) as u32;
 
@@ -105,7 +117,7 @@ fn direct_conv2d_kernel<E: Numeric, NIn: Size, NOut: Size>(
         has_padding,
     );
 
-    output[ABSOLUTE_POS] = sum;
+    output[absolute_unit] = sum;
 }
 
 #[derive(CubeType, Clone)]
@@ -276,45 +288,55 @@ pub fn conv_direct<R: CubeRuntime, const N: usize>(
     // Use channels_per_group instead of in_channels to avoid issues here
     let vector_size_in = max_vector_size(&weight);
 
-    let shape_out = output.meta.shape()[1..dim_c]
-        .iter()
-        .map(|s| *s as u32)
-        .collect();
     let shape_out_c = out_channels as u32;
 
-    let mut conv_params = SequenceArg::new();
-
-    for i in 0..kernel_shape.len() {
-        conv_params.push(ConvParamLaunch::new(
-            options.stride[i] as u32,
-            options.dilation[i] as u32,
-            options.padding[i] as i32,
-        ));
-    }
-
     let working_units = output.meta.num_elements() / vector_size_out;
-    let cube_dim = CubeDim::new(&input.client, working_units);
-    let cube_count = calculate_cube_count_elemwise(&input.client, working_units, cube_dim);
+    let launch_limit = DIRECT_MAX_WORKING_UNITS_PER_DISPATCH.min(working_units.max(1));
 
-    unsafe {
-        direct_conv2d_kernel::launch_unchecked(
-            &output.client,
-            cube_count,
-            cube_dim,
-            address_type!(input, weight, bias, output),
-            vector_size_in,
-            vector_size_out,
-            input.into_tensor_arg(),
-            weight.into_tensor_arg(),
-            bias.map(|b| b.into_tensor_arg()).into(),
-            output.clone().into_linear_view(),
-            Conv2dArgsLaunch::new(conv_params, channels_per_group as u32),
-            shape_out,
-            shape_out_c,
-            options.padding.iter().any(|it| *it != 0),
-            out_dtype.into(),
-        )
-    };
+    let mut start_unit = 0usize;
+    while start_unit < working_units {
+        let units_this_launch = (working_units - start_unit).min(launch_limit);
+        let cube_dim = CubeDim::new(&input.client, units_this_launch);
+        let cube_count = calculate_cube_count_elemwise(&input.client, units_this_launch, cube_dim);
+
+        let mut shape_out = SequenceArg::new();
+        for size in &output.meta.shape()[1..dim_c] {
+            shape_out.push(*size as u32);
+        }
+
+        let mut conv_params = SequenceArg::new();
+        for i in 0..kernel_shape.len() {
+            conv_params.push(ConvParamLaunch::new(
+                options.stride[i] as u32,
+                options.dilation[i] as u32,
+                options.padding[i] as i32,
+            ));
+        }
+
+        unsafe {
+            direct_conv2d_kernel::launch_unchecked(
+                &output.client,
+                cube_count,
+                cube_dim,
+                address_type!(input, weight, bias, output),
+                vector_size_in,
+                vector_size_out,
+                input.clone().into_tensor_arg(),
+                weight.clone().into_tensor_arg(),
+                bias.clone().map(|b| b.into_tensor_arg()).into(),
+                output.clone().into_linear_view(),
+                Conv2dArgsLaunch::new(conv_params, channels_per_group as u32),
+                shape_out,
+                shape_out_c,
+                start_unit,
+                units_this_launch,
+                options.padding.iter().any(|it| *it != 0),
+                out_dtype.into(),
+            )
+        };
+
+        start_unit += units_this_launch;
+    }
 
     Ok(output)
 }
