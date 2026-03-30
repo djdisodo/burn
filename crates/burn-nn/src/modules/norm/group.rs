@@ -5,7 +5,7 @@ use burn::config::Config;
 use burn::module::Module;
 use burn::module::Param;
 use burn::module::{Content, DisplaySettings, ModuleDisplay};
-use burn::tensor::Tensor;
+use burn::tensor::{DType, FloatDType, Tensor};
 use burn::tensor::backend::Backend;
 
 /// Configuration to create a [GroupNorm](GroupNorm) layer using the [init function](GroupNormConfig::init).
@@ -165,15 +165,42 @@ pub(crate) fn group_norm<B: Backend, const D: usize>(
     let num_channels = shape[1];
 
     let hidden_size = shape[2..].iter().product::<usize>() * num_channels / num_groups;
+    let original_dtype = input.dtype();
+    let original_float_dtype: FloatDType = original_dtype.into();
+    let device = input.device();
+
+    // Upcast normalization math when hidden_size cannot be represented robustly
+    // in the input float dtype. Cast the final result back to the original dtype.
+    let compute_dtype = select_groupnorm_compute_dtype::<B>(original_dtype, hidden_size, &device);
+
     let input = input.reshape([batch_size, num_groups, hidden_size]);
 
-    let mean = input.clone().sum_dim(2) / hidden_size as f64;
-    let input = input.sub(mean);
+    // Only upcast the statistics path when needed (mean/variance reduction),
+    // then bring mean/variance back to original dtype for the normalized output.
+    let (input_centered, var) = match compute_dtype {
+        Some(dtype) if dtype != original_float_dtype => {
+            let input_stats = input.clone().cast(dtype);
+            let mean_stats = input_stats.clone().sum_dim(2) / hidden_size as f64;
+            let centered_stats = input_stats.sub(mean_stats.clone());
+            let var_stats = centered_stats.square().sum_dim(2) / hidden_size as f64;
 
-    let var = input.clone().square().sum_dim(2) / hidden_size as f64;
-    let input_normalized = input.div(var.add_scalar(epsilon).sqrt());
+            let mean = mean_stats.cast(original_float_dtype);
+            let var = var_stats.cast(original_float_dtype);
+            let centered = input.sub(mean);
 
-    if affine {
+            (centered, var)
+        }
+        _ => {
+            let mean = input.clone().sum_dim(2) / hidden_size as f64;
+            let centered = input.sub(mean);
+            let var = centered.clone().square().sum_dim(2) / hidden_size as f64;
+            (centered, var)
+        }
+    };
+
+    let input_normalized = input_centered.div(var.add_scalar(epsilon).sqrt());
+
+    let output = if affine {
         let mut affine_shape = [1; D];
         affine_shape[1] = num_channels;
 
@@ -183,6 +210,39 @@ pub(crate) fn group_norm<B: Backend, const D: usize>(
             .add(beta.clone().unwrap().reshape(affine_shape))
     } else {
         input_normalized.reshape(shape)
+    };
+
+    output
+}
+
+fn select_groupnorm_compute_dtype<B: Backend>(
+    input_dtype: DType,
+    hidden_size: usize,
+    device: &B::Device,
+) -> Option<FloatDType> {
+    // f16 can't represent divisors > 65504 without overflow.
+    const F16_MAX_FINITE_AS_USIZE: usize = 65_504;
+    // f32 stops representing consecutive integers exactly past 2^24.
+    const F32_EXACT_INT_LIMIT: usize = 16_777_216;
+
+    let preferred = match input_dtype {
+        DType::F16 if hidden_size > F16_MAX_FINITE_AS_USIZE => Some(FloatDType::F32),
+        DType::F32 | DType::Flex32 | DType::BF16 if hidden_size > F32_EXACT_INT_LIMIT => {
+            Some(FloatDType::F64)
+        }
+        _ => None,
+    };
+
+    match preferred {
+        Some(FloatDType::F64) if !B::supports_dtype(device, DType::F64) => {
+            if B::supports_dtype(device, DType::F32) {
+                Some(FloatDType::F32)
+            } else {
+                None
+            }
+        }
+        Some(FloatDType::F32) if !B::supports_dtype(device, DType::F32) => None,
+        _ => preferred,
     }
 }
 
