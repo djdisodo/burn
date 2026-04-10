@@ -5,8 +5,8 @@ use burn::config::Config;
 use burn::module::Module;
 use burn::module::Param;
 use burn::module::{Content, DisplaySettings, ModuleDisplay};
-use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
+use burn::tensor::{DType, Tensor};
 
 /// Configuration to create a [GroupNorm](GroupNorm) layer using the [init function](GroupNormConfig::init).
 #[derive(Debug, Config)]
@@ -153,6 +153,7 @@ pub(crate) fn group_norm<B: Backend, const D: usize>(
         panic!("Affine is set to true, but gamma or beta is None");
     }
 
+    let input_dtype = input.dtype();
     let shape = input.shape();
     if shape.num_elements() <= 2 {
         panic!(
@@ -165,7 +166,9 @@ pub(crate) fn group_norm<B: Backend, const D: usize>(
     let num_channels = shape[1];
 
     let hidden_size = shape[2..].iter().product::<usize>() * num_channels / num_groups;
-    let input = input.reshape([batch_size, num_groups, hidden_size]);
+    let input = input
+        .cast(DType::F32)
+        .reshape([batch_size, num_groups, hidden_size]);
 
     let mean = input.clone().sum_dim(2) / hidden_size as f64;
     let input = input.sub(mean);
@@ -173,17 +176,25 @@ pub(crate) fn group_norm<B: Backend, const D: usize>(
     let var = input.clone().square().sum_dim(2) / hidden_size as f64;
     let input_normalized = input.div(var.add_scalar(epsilon).sqrt());
 
-    if affine {
+    let output = if affine {
         let mut affine_shape = [1; D];
         affine_shape[1] = num_channels;
 
         input_normalized
-            .reshape(shape)
-            .mul(gamma.clone().unwrap().reshape(affine_shape))
-            .add(beta.clone().unwrap().reshape(affine_shape))
+            .reshape(shape.clone())
+            .mul(
+                gamma
+                    .clone()
+                    .unwrap()
+                    .cast(DType::F32)
+                    .reshape(affine_shape),
+            )
+            .add(beta.clone().unwrap().cast(DType::F32).reshape(affine_shape))
     } else {
         input_normalized.reshape(shape)
-    }
+    };
+
+    output.cast(input_dtype)
 }
 
 #[cfg(test)]
@@ -192,7 +203,7 @@ mod tests {
     use crate::TestBackend;
     use alloc::format;
     use burn::tensor::TensorData;
-    use burn::tensor::{Tolerance, ops::FloatElem};
+    use burn::tensor::{ops::FloatElem, Tolerance};
     type FT = FloatElem<TestBackend>;
 
     #[test]
